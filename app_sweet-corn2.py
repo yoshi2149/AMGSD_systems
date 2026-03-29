@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, date
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import math
 
 import AMD_Tools4 as amd
-from AMD_DayLength3 import daylength  # 利用可能な前提。名前が違う場合はここを変更。
 
 app = Flask(__name__)
 
@@ -15,6 +15,7 @@ app = Flask(__name__)
 # 定数
 # =========================================================
 DATE_FMT = "%Y-%m-%d"
+DL_CSV_PATH = Path(__file__).resolve().parent / "sweetcorn_data-DL.csv"
 
 
 # =========================================================
@@ -196,23 +197,58 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
 
 
 # =========================================================
-# 日長
+# 日長CSV
 # =========================================================
-def add_daylength(df: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
+def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
     """
-    日長列 DL_hours を追加
+    sweetcorn_data-DL.csv を読み込む
+    想定列:
+      date, DL
+    例:
+      4/1, 0.5305555556
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Daylength CSV not found: {csv_path}")
+
+    df_dl = pd.read_csv(csv_path)
+
+    required_cols = {"date", "DL"}
+    if not required_cols.issubset(df_dl.columns):
+        raise ValueError(f"Daylength CSV must contain columns: {required_cols}")
+
+    df_dl = df_dl.copy()
+    df_dl["month_day"] = df_dl["date"].astype(str).str.strip()
+    df_dl["DL"] = pd.to_numeric(df_dl["DL"], errors="coerce")
+
+    if df_dl["DL"].isna().any():
+        bad_rows = df_dl[df_dl["DL"].isna()]
+        raise ValueError(f"Invalid DL values found in daylength CSV: {bad_rows.to_dict(orient='records')}")
+
+    # 念のため重複除去
+    df_dl = df_dl.drop_duplicates(subset=["month_day"]).reset_index(drop=True)
+
+    return df_dl[["month_day", "DL"]]
+
+
+def add_daylength_from_csv(df: pd.DataFrame, df_dl_master: pd.DataFrame) -> pd.DataFrame:
+    """
+    date 列から month_day を作り、CSVの日長を結合して DL_hours を追加
     """
     if df.empty:
-        df = df.copy()
-        df["DL_hours"] = []
-        return df
-
-    tim = [datetime.combine(d, datetime.min.time()) for d in df["date"].tolist()]
-    dl = daylength(tim, [lat], [lon])  # shape: (time, 1, 1)
-    dl_flat = np.asarray(dl)[:, 0, 0]
+        out = df.copy()
+        out["DL_hours"] = pd.Series(dtype=float)
+        return out
 
     out = df.copy()
-    out["DL_hours"] = dl_flat
+    out["month_day"] = out["date"].map(lambda d: f"{d.month}/{d.day}")
+    out = out.merge(df_dl_master, on="month_day", how="left")
+
+    if out["DL"].isna().any():
+        missing = out.loc[out["DL"].isna(), "month_day"].drop_duplicates().tolist()
+        raise ValueError(f"Missing daylength data for month/day: {missing}")
+
+    out["DL_hours"] = out["DL"].astype(float)
+    out = out.drop(columns=["month_day", "DL"])
     return out
 
 
@@ -235,15 +271,12 @@ def calc_daily_gdd_core(tmean, tmax, method, t_base, t_ceiling=None):
     method 1~4 のコア部分（日長なし）
     """
     if method == 1:
-        # max(0, T_mea - T_b)
         return max(0.0, tmean - t_base)
 
     if method == 2:
-        # max(0, T_max - T_b)
         return max(0.0, tmax - t_base)
 
     if method == 3:
-        # T_max ベース + ceiling 補正
         if tmax <= t_base:
             return 0.0
         if tmax <= t_ceiling:
@@ -253,7 +286,6 @@ def calc_daily_gdd_core(tmean, tmax, method, t_base, t_ceiling=None):
         return max(0.0, val)
 
     if method == 4:
-        # T_mea ベース + ceiling 補正量は T_max 超過分
         if tmean <= t_base:
             return 0.0
         if tmax <= t_ceiling:
@@ -299,8 +331,7 @@ def build_accumulation_dataframe(
     t_base: float,
     t_ceiling,
     target_gdd: float,
-    lat: float,
-    lon: float
+    df_dl_master: pd.DataFrame
 ):
     """
     任意期間の積算 DataFrame を作成し、
@@ -320,7 +351,7 @@ def build_accumulation_dataframe(
         }
 
     if method in [5, 6, 7, 8]:
-        df = add_daylength(df, lat, lon)
+        df = add_daylength_from_csv(df, df_dl_master)
     else:
         df["DL_hours"] = np.nan
 
@@ -399,6 +430,9 @@ def get_climate_data():
         yesterday = today - timedelta(days=1)
         forecast_end = today + timedelta(days=26)
 
+        # 0. 日長マスタ
+        df_dl_master = load_daylength_table()
+
         # 1. 平年値
         df_avg = build_average_temperature(lat, lon, fiscal_year, n_years=3)
 
@@ -417,8 +451,7 @@ def get_climate_data():
             t_base=params["base_threshold1"],
             t_ceiling=params["ceiling_threshold1"],
             target_gdd=params["gdd1_target"],
-            lat=lat,
-            lon=lon
+            df_dl_master=df_dl_master
         )
 
         # 5. ct2（収穫日予測用）
@@ -430,8 +463,7 @@ def get_climate_data():
             t_base=params["base_threshold2"],
             t_ceiling=params["ceiling_threshold2"],
             target_gdd=params["gdd2_target"],
-            lat=lat,
-            lon=lon
+            df_dl_master=df_dl_master
         )
 
         # 6. 履歴値（開発概要どおり単純積算）
@@ -482,7 +514,8 @@ def get_climate_data():
                 "today_utc": today.isoformat(),
                 "yesterday_utc": yesterday.isoformat(),
                 "forecast_end_utc": forecast_end.isoformat(),
-                "fiscal_year": fiscal_year
+                "fiscal_year": fiscal_year,
+                "daylength_csv": str(DL_CSV_PATH.name)
             }
         })
 
