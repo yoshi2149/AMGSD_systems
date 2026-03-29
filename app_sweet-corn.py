@@ -14,114 +14,66 @@ import numpy as np
 import math
 import AMD_Tools4 as amd  # AMD_Tools4.py が同じディレクトリにある前提
 
-# Flaskアプリを作成
 app = Flask(__name__)
 
-# /get_temp に POST リクエストが来たときに実行されるAPI
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
-    # ---------------------------------------------------------
-    # 1. GASなどから送られてきたJSONデータを受け取る
-    # ---------------------------------------------------------
     d = request.get_json()
-
-    # 緯度・経度を取得
     lat, lon = map(float, (d["lat"], d["lon"]))
-
-    # 積算1に関する入力値を取得
-    threshold = float(d["threshold"])          # 積算温度の下限閾値
-    gdd1_target = float(d["gdd1"])             # 目標積算温度1
-    ct1_start = datetime.fromisoformat(d["ct1_start"]).date()  # 積算開始日1
-    ct1_end   = datetime.fromisoformat(d["ct1_end"]).date()    # 積算終了日1
-
-    # 積算2に関する入力値を取得
-    threshold2 = float(d["threshold2"])        # 積算温度の下限閾値2
-    gdd2_target = float(d["gdd2"])             # 目標積算温度2
-    ct2_start = datetime.fromisoformat(d["ct2_start"]).date()  # 積算開始日2
-    ct2_end   = datetime.fromisoformat(d["ct2_end"]).date()    # 積算終了日2
+    threshold = float(d["threshold"])
+    gdd1_target = float(d["gdd1"])
+    ct1_start = datetime.fromisoformat(d["ct1_start"]).date()  
+    ct1_end   = datetime.fromisoformat(d["ct1_end"]).date()
+    threshold2 = float(d["threshold2"])
+    gdd2_target = float(d["gdd2"])
+    ct2_start = datetime.fromisoformat(d["ct2_start"]).date()  
+    ct2_end   = datetime.fromisoformat(d["ct2_end"]).date()
     
-    # ---------------------------------------------------------
-    # 2. 年度を判定する
-    #    4月以降ならその年、1〜3月なら前年を年度開始年とする
-    # ---------------------------------------------------------
     today = datetime.utcnow().date()
     this_year = today.year if today.month >= 4 else today.year - 1
     start_year = this_year - 3
 
-    # ---------------------------------------------------------
-    # 3. 過去3年分の平年値（平均気温）を作成する
-    # ---------------------------------------------------------
+    # --- 平年値の計算（過去3年） ---
     all_years_data = []
-
-    # 直近3年度分についてループ
     for year in range(start_year, start_year + 3):
         start = f"{year}-04-01"
         end = f"{year+1}-03-31"
-
-        # 指定地点の平均気温を取得
         temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
         flat_temp = temp[:, 0, 0]
 
-        # 日付と平均気温をDataFrame化
         df = pd.DataFrame({
             "datetime": pd.to_datetime(tim),
             "tave": flat_temp
         })
-
-        # 月日（mm-dd）だけ取り出して、年度をまたいでも比較できるようにする
         df["month_day"] = df["datetime"].dt.strftime("%m-%d")
         all_years_data.append(df[["month_day", "tave"]])
 
-    # 3年分を縦に結合
     df_concat = pd.concat(all_years_data)
-
-    # 同じ month_day ごとに平均をとって平年値を作成
     df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
     df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
 
-    # ---------------------------------------------------------
-    # 4. 平年値を4月1日始まりの順に並び替える
-    # ---------------------------------------------------------
+    # 並び替え（4月始まり）
     def reorder_from_april(df):
         df = df.copy()
-
-        # 並び替え用の仮の日付を作る（2000年で統一）
         df["sort_key"] = pd.to_datetime("2000-" + df["month_day"])
         df = df.sort_values("sort_key").reset_index(drop=True)
-
-        # 4/1 の行番号を取得し、そこから始まるように並べ替える
         start_idx = df[df["month_day"] == "04-01"].index[0]
         return pd.concat([df.iloc[start_idx:], df.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
 
     df_avg = reorder_from_april(df_avg)
-
-    # 小数1位に丸める
     df_avg["tave_avg"] = df_avg["tave_avg"].round(1)
 
-    # ---------------------------------------------------------
-    # 5. 今年度の気象データを取得する
-    #    ・平均気温 TMP_mea
-    #    ・降水量   APCPRA
-    # ---------------------------------------------------------
+    # --- 今年度の実測値（＋タグ） ---
     start_this = f"{this_year}-04-01"
     end_this = f"{this_year + 1}-03-31"
-
     temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [start_this, end_this], [lat, lat, lon, lon])
     prcp_this, *_ = amd.GetMetData("APCPRA",  [start_this, end_this], [lat, lat, lon, lon])
-
-    # 今年度データをDataFrame化
     df_this = pd.DataFrame({
         "date"      : pd.to_datetime(tim_this).map(lambda d: d.date()),
         "tave_this" : temp_this[:, 0, 0],
-        "prcp_this" : prcp_this[:, 0, 0]
+        "prcp_this" : prcp_this[:, 0, 0]       
     })    
 
-    # ---------------------------------------------------------
-    # 6. 日付ごとにタグを付ける
-    #    ・昨日まで      -> past
-    #    ・今日〜26日後  -> forecast
-    #    ・それ以降      -> normal
-    # ---------------------------------------------------------
     yesterday = today - timedelta(days=1)
     forecast_end = today + timedelta(days=26)
 
@@ -132,17 +84,15 @@ def get_climate_data():
             return "forecast"
         else:
             return "normal"
-
     df_this["tag"] = df_this["date"].map(assign_tag)
 
-    # forecast 部分だけ別に抽出
     df_forecast = (
         df_this.loc[df_this["tag"] == "forecast"]
                 .reset_index(drop=True)
     )
     
     # =========================================================
-    # 7. 任意期間の累積積算温度・累積降水量を計算する関数
+    # 📌 ヘルパー関数：任意期間の累積 GDD / 降水
     # =========================================================
     def make_hist_dict(date_start, date_end, thr, df_src):
         """
@@ -151,142 +101,151 @@ def get_climate_data():
           ・累積降水量 Σ prcp_this
         を返す。期間にデータが無い場合はすべて None。
         """
-        # 開始日が終了日より後なら空を返す
+        # 開始日が終了日より後（例：昨日 < start）のときは空辞書
         if date_end < date_start:
             return {"date": None, "cum_ct": None, "cum_pr": None}
     
-        # 指定期間を抽出
         mask = (df_src["date"] >= date_start) & (df_src["date"] <= date_end)
         if not mask.any():
             return {"date": None, "cum_ct": None, "cum_pr": None}
     
         tmp = df_src.loc[mask].copy()
-
-        # 日ごとの積算温度 = max(0, 平均気温 - 閾値)
         tmp["daily_ct"] = (tmp["tave_this"] - thr).clip(lower=0)
-
-        # 累積値を辞書で返す
         return {
             "date"   : date_end.isoformat(),
             "cum_ct" : round(tmp["daily_ct"].sum(), 1),
             "cum_pr" : round(tmp["prcp_this"].sum(), 1)
         }
     
-    # forecast の日付を JSON 返却しやすいよう文字列に変換
+    # 例：必要に応じて日付を文字列化して返却用に整形
     df_forecast["date"] = df_forecast["date"].map(lambda d: d.isoformat())
     
     # --------------------------------------------------------------------------
-    # 8. 平年値を今年度データに結合する
+    # ① month_day 列を追加してキーをそろえる
     # --------------------------------------------------------------------------
-
-    # ① month_day 列を追加して、平年値と結合できるようにする
     df_this["month_day"] = df_this["date"].map(lambda d: d.strftime("%m-%d"))
     
+    # --------------------------------------------------------------------------
     # ② 平年値 df_avg と結合して tave_avg を取得
+    # --------------------------------------------------------------------------
     df_this = df_this.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
     
+    # --------------------------------------------------------------------------
     # ③ "normal" 行だけ今年度値を平年値で置換
-    #    （観測も予報もない先の日付には平年値を使う）
+    # --------------------------------------------------------------------------
     mask = df_this["tag"] == "normal"
     df_this.loc[mask, "tave_this"] = df_this.loc[mask, "tave_avg"]
     
-    # ④ 使い終わった列を削除
+    # --------------------------------------------------------------------------
+    # ④ もう使わない列を整理
+    # --------------------------------------------------------------------------
     df_this.drop(columns=["month_day", "tave_avg"], inplace=True)
 
-    # ---------------------------------------------------------
-    # 9. 積算範囲1（ct1_start〜ct1_end）の積算温度を計算
-    # ---------------------------------------------------------
+     # --- 積算範囲1 ---
     ct1_start = datetime.fromisoformat(d["ct1_start"]).date()
     ct1_end   = datetime.fromisoformat(d["ct1_end"]).date()
     
-    # 指定期間を抽出
     mask = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
     df_ct1_period = df_this.loc[mask].reset_index(drop=True)
 
-    # 積算計算用 DataFrame を作成
+    # ──────────────────────────────────────────
+    # 1. 積算温度 DataFrame の作成
+    #    ① 日ごとの増分: max(0, tave - threshold)
+    #    ② 累積: 上記増分を累積和
+    # ──────────────────────────────────────────
     df_ct1 = df_ct1_period.copy()
     
-    # 日ごとの積算温度
+    # 日増分（閾値以下なら 0）
     df_ct1["daily_ct"] = (df_ct1["tave_this"] - threshold)\
                                .clip(lower=0)\
-                               .round(1)
+                               .round(1)          # 小数 1 位に丸め（好みで）
     
-    # 累積積算温度
+    # 累積和
     df_ct1["cum_ct"] = df_ct1["daily_ct"].cumsum().round(1)
 
-    # 日ごとの降水量
+    # ③ 日ごとの降水量（小数 1 位に丸めたい場合は .round(1)）
     df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
     
-    # 累積降水量
+    # ④ 累積降水量
     df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
 
-    # 目標積算温度に最も近い日を探す
+    # ───────────────────────────────────────────────
+    # 1. 目標値に最も近い日を抽出
+    # ───────────────────────────────────────────────
     df_ct1["abs_diff"] = (df_ct1["cum_ct"] - gdd1_target).abs()
-    idx_closest = df_ct1["abs_diff"].idxmin()
+    idx_closest = df_ct1["abs_diff"].idxmin()      # 最小誤差の行番号
     row_close1   = df_ct1.loc[idx_closest]
 
-    # 返却用辞書を作成
+    
+    # ───────────────────────────────────────────────
+    # 2. JSON 返却用に date を文字列化
+    # ───────────────────────────────────────────────
     closest_dict = {
-        "date"      : row_close1["date"].isoformat(),
-        "cum_ct"    : round(row_close1["cum_ct"], 1),
-        "daily_ct"  : round(row_close1["daily_ct"], 1),
-        "abs_diff"  : round(row_close1["abs_diff"], 1)
+        "date"      : row_close1["date"].isoformat(),   # YYYY-MM-DD
+        "cum_ct"    : round(row_close1["cum_ct"], 1),   # 積算温度
+        "daily_ct"  : round(row_close1["daily_ct"], 1), # 参考：当日の増分
+        "abs_diff"  : round(row_close1["abs_diff"], 1)  # 誤差
     }
     
-    # ---------------------------------------------------------
-    # 10. 積算範囲2（ct2_start〜ct2_end）の積算温度を計算
-    # ---------------------------------------------------------
+     # --- 積算範囲2 ---
     ct2_start = datetime.fromisoformat(d["ct2_start"]).date()
     ct2_end   = datetime.fromisoformat(d["ct2_end"]).date()
     
-    # 指定期間を抽出
     mask = (df_this["date"] >= ct2_start) & (df_this["date"] <= ct2_end)
     df_ct2_period = df_this.loc[mask].reset_index(drop=True)
 
-    # 積算計算用 DataFrame を作成
+    # ──────────────────────────────────────────
+    # 1. 積算温度 DataFrame の作成
+    #    ① 日ごとの増分: max(0, tave - threshold)
+    #    ② 累積: 上記増分を累積和
+    # ──────────────────────────────────────────
     df_ct2 = df_ct2_period.copy()
     
-    # 日ごとの積算温度
+    # 日増分（閾値以下なら 0）
     df_ct2["daily_ct"] = (df_ct2["tave_this"] - threshold2)\
                                .clip(lower=0)\
-                               .round(1)
+                               .round(1)          # 小数 1 位に丸め（好みで）
     
-    # 累積積算温度
+    # 累積和
     df_ct2["cum_ct"] = df_ct2["daily_ct"].cumsum().round(1)
 
-    # 日ごとの降水量
+    # ③ 日ごとの降水量（小数 1 位に丸めたい場合は .round(1)）
     df_ct2["daily_pr"] = df_ct2["prcp_this"].round(1)
     
-    # 累積降水量
+    # ④ 累積降水量
     df_ct2["cum_pr"] = df_ct2["daily_pr"].cumsum().round(1)
 
-    # 目標積算温度に最も近い日を探す
+    # ───────────────────────────────────────────────
+    # 1. 目標値に最も近い日を抽出
+    # ───────────────────────────────────────────────
     df_ct2["abs_diff"] = (df_ct2["cum_ct"] - gdd2_target).abs()
-    idx_closest = df_ct2["abs_diff"].idxmin()
+    idx_closest = df_ct2["abs_diff"].idxmin()      # 最小誤差の行番号
     row_close2   = df_ct2.loc[idx_closest]
 
-    # 返却用辞書を作成
+
+    
+    # ───────────────────────────────────────────────
+    # 2. JSON 返却用に date を文字列化
+    # ───────────────────────────────────────────────
     closest2_dict = {
-        "date"      : row_close2["date"].isoformat(),
-        "cum_ct"    : round(row_close2["cum_ct"], 1),
-        "daily_ct"  : round(row_close2["daily_ct"], 1),
-        "abs_diff"  : round(row_close2["abs_diff"], 1)
+        "date"      : row_close2["date"].isoformat(),   # YYYY-MM-DD
+        "cum_ct"    : round(row_close2["cum_ct"], 1),   # 積算温度
+        "daily_ct"  : round(row_close2["daily_ct"], 1), # 参考：当日の増分
+        "abs_diff"  : round(row_close2["abs_diff"], 1)  # 誤差
     }
     
     # =========================================================
-    # 11. 履歴値を計算する
+    # ★ ct1_start～昨日まで
     # =========================================================
-
-    # ct1_start から昨日までの累積
     hist_dict1 = make_hist_dict(ct1_start, yesterday, threshold, df_this)
     
-    # ct2 は、ct1で目標に最も近かった日から昨日までの累積
-    closest1_date = row_close1["date"]
+    # =========================================================
+    # ★ ct2_start～昨日まで
+    # =========================================================
+    closest1_date = row_close1["date"]          # datetime.date 型
     hist_dict2    = make_hist_dict(closest1_date, yesterday, threshold2, df_this)
     
-    # ---------------------------------------------------------
-    # 12. NaN → None 変換用関数
-    # ---------------------------------------------------------
+    # NaN → None 対応
     def replace_nan_with_none(data):
         if isinstance(data, list):
             return [replace_nan_with_none(x) for x in data]
@@ -297,18 +256,13 @@ def get_climate_data():
         else:
             return data
             
-    # ---------------------------------------------------------
-    # 13. JSON返却のため date 列を文字列へ統一
-    # ---------------------------------------------------------
-    df_this["date"] = df_this["date"].map(lambda d: d.isoformat())
-    df_ct1_period["date"] = df_ct1_period["date"].map(lambda d: d.isoformat())
-    df_ct2_period["date"] = df_ct2_period["date"].map(lambda d: d.isoformat())
-    df_ct1["date"] = df_ct1["date"].map(lambda d: d.isoformat())
-    df_ct2["date"] = df_ct2["date"].map(lambda d: d.isoformat())
+    # ここで date 列を文字列へ統一      
+    df_this["date"] = df_this["date"].map(lambda d: d.isoformat())   
+    df_ct1_period["date"] = df_ct1_period["date"].map(lambda d: d.isoformat()) 
+    df_ct2_period["date"] = df_ct2_period["date"].map(lambda d: d.isoformat()) 
+    df_ct1["date"] = df_ct1["date"].map(lambda d: d.isoformat()) 
+    df_ct2["date"] = df_ct2["date"].map(lambda d: d.isoformat()) 
     
-    # ---------------------------------------------------------
-    # 14. DataFrame を辞書リストに変換し、NaN を None に置換
-    # ---------------------------------------------------------
     df_avg_clean = replace_nan_with_none(df_avg.to_dict(orient="records"))
     df_this_clean = replace_nan_with_none(df_this.to_dict(orient="records"))
     df_ct1_period_clean = replace_nan_with_none(df_ct1_period.to_dict(orient="records"))
@@ -317,23 +271,19 @@ def get_climate_data():
     df_ct2_clean = replace_nan_with_none(df_ct2.to_dict(orient="records"))
     df_forecast_clean = replace_nan_with_none(df_forecast.to_dict(orient="records"))
 
-    # ---------------------------------------------------------
-    # 15. JSON形式で返却
-    # ---------------------------------------------------------
     return jsonify({
-        "average": df_avg_clean,                     # 過去3年平均平年値
-        "this_year": df_this_clean,                 # 今年度データ（気温・降水量・タグ）
-        "ct1_period": df_ct1_period_clean,          # 積算範囲1の元データ
-        "ct1"       : df_ct1_clean,                 # 積算範囲1の積算結果
-        "gdd1_target": closest_dict,                # 目標積算温度1に最も近い日
-        "ct2_period": df_ct2_period_clean,          # 積算範囲2の元データ
-        "ct2"       : df_ct2_clean,                 # 積算範囲2の積算結果
-        "gdd2_target": closest2_dict,               # 目標積算温度2に最も近い日
-        "ct1_until_yesterday": hist_dict1,          # ct1_start〜昨日までの累積
-        "ct2_until_yesterday": hist_dict2,          # closest1_date〜昨日までの累積
-        "forecast": df_forecast_clean               # forecast タグ部分だけ抽出したデータ
+        "average": df_avg_clean,
+        "this_year": df_this_clean,
+        "ct1_period": df_ct1_period_clean,
+        "ct1"       : df_ct1_clean,
+        "gdd1_target": closest_dict,
+        "ct2_period": df_ct2_period_clean,
+        "ct2"       : df_ct2_clean,
+        "gdd2_target": closest2_dict,
+        "ct1_until_yesterday": hist_dict1, 
+        "ct2_until_yesterday": hist_dict2, 
+        "forecast": df_forecast_clean
     })
 
-# ローカル実行時は 0.0.0.0:8080 で起動
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
