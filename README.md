@@ -120,3 +120,10 @@
     - 57, 58行目にID, PWを入力してください
     - それ以外は編集しないでください
 </details>
+
+<details>
+<summary>requirement.txt</summary>
+  **役割：ライブラリの集約**
+  
+  - pythonプログラムで使用しているライブラリの一覧です。
+</details>
